@@ -1,0 +1,156 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的版本号，形如 v0.1.0'
+        required: true
+        type: string
+      prerelease:
+        description: '标记为预发布版本'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows:
+    name: 发布 Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 确定版本号
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag='${{ inputs.tag }}'
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          case "$tag" in
+            v[0-9]*) ;;
+            *) echo "::error::版本号必须形如 v0.1.0，实际收到：$tag"; exit 1 ;;
+          esac
+          version="${tag#v}"
+          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "$version" != "$manifest" ]; then
+            echo "::error::标签 $tag 与 Cargo.toml 中的版本 $manifest 不一致"
+            exit 1
+          fi
+          name="flype-word-${tag}-windows-x86_64"
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "name=$name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: 安装 Rust 工具链
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          rustc --version
+          cargo --version
+
+      - name: 缓存 Cargo 目录
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ runner.os }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-release-
+
+      - name: 运行测试
+        run: cargo test --release --locked --target x86_64-pc-windows-msvc
+
+      - name: 构建发布版可执行文件
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: 打包
+        id: package
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = '${{ steps.meta.outputs.name }}'
+          $stage = "dist/$name"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/flype-word.exe' $stage
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/flype-word-gui.exe' $stage
+          Copy-Item 'README.md' $stage
+          Copy-Item 'examples/sample.txt' $stage
+          $zip = "dist/$name.zip"
+          Compress-Archive -Path $stage -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
+          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Get-ChildItem dist
+
+      - name: 上传构建产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.meta.outputs.name }}
+          path: |
+            dist/${{ steps.meta.outputs.name }}.zip
+            dist/${{ steps.meta.outputs.name }}.zip.sha256
+          if-no-files-found: error
+
+      - name: 生成发布说明
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > release-notes.md <<EOF
+          小鹤双拼词库生成器 ${{ steps.meta.outputs.tag }}（Windows x86_64）。
+
+          压缩包内含：
+
+          - \`flype-word.exe\`：命令行工具，提供 \`extract\` 和 \`encode\` 两个子命令。
+          - \`flype-word-gui.exe\`：图形界面，字体已内嵌，解压即用。
+          - \`README.md\`、\`sample.txt\`：使用说明与示例原文。
+
+          解压后直接运行即可，无需安装运行库。
+
+          SHA256（\`${{ steps.meta.outputs.name }}.zip\`）：
+
+          \`\`\`
+          ${{ steps.package.outputs.sha256 }}
+          \`\`\`
+          EOF
+          cat release-notes.md
+
+      - name: 创建 GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.meta.outputs.tag }}'
+          name='${{ steps.meta.outputs.name }}'
+          args=(--title "flype-word $tag" --notes-file release-notes.md --target "$GITHUB_SHA")
+          if [ "${{ inputs.prerelease }}" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "dist/$name.zip" "dist/$name.zip.sha256" --clobber
+          else
+            gh release create "$tag" "${args[@]}" "dist/$name.zip" "dist/$name.zip.sha256"
+          fi
+          gh release view "$tag"
