@@ -1,15 +1,18 @@
 name: Release
 
+# 发布方式：把 Cargo.toml 里的 version 提升到新版本并推送即可。
+# 工作流会读取 Cargo.toml 的版本号，构建 Windows 版本，
+# 并以 v<version> 为标签创建 GitHub Release（标签由工作流自动打上）。
+# 同版本重复推送不会重复发布，可用手动触发重新上传构建产物。
 on:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - '**'
+    paths:
+      - 'Cargo.toml'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
     inputs:
-      tag:
-        description: '要发布的版本号，形如 v0.1.0'
-        required: true
-        type: string
       prerelease:
         description: '标记为预发布版本'
         required: false
@@ -22,6 +25,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   windows:
     name: 发布 Windows x86_64
@@ -33,31 +40,35 @@ jobs:
       - name: 确定版本号
         id: meta
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag='${{ inputs.tag }}'
-          else
-            tag="${GITHUB_REF_NAME}"
-          fi
-          case "$tag" in
-            v[0-9]*) ;;
-            *) echo "::error::版本号必须形如 v0.1.0，实际收到：$tag"; exit 1 ;;
-          esac
-          version="${tag#v}"
-          manifest="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
-          if [ "$version" != "$manifest" ]; then
-            echo "::error::标签 $tag 与 Cargo.toml 中的版本 $manifest 不一致"
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ -z "$version" ]; then
+            echo "::error::无法从 Cargo.toml 读取版本号"
             exit 1
           fi
+          tag="v$version"
           name="flype-word-${tag}-windows-x86_64"
+          skip=false
+          if gh release view "$tag" >/dev/null 2>&1; then
+            if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              echo "::notice::$tag 已存在，将重新上传构建产物"
+            else
+              echo "::notice::$tag 已经发布过，跳过本次发布；如需发布新版本请提升 Cargo.toml 中的 version"
+              skip=true
+            fi
+          fi
           {
-            echo "tag=$tag"
             echo "version=$version"
+            echo "tag=$tag"
             echo "name=$name"
+            echo "skip=$skip"
           } >> "$GITHUB_OUTPUT"
 
       - name: 安装 Rust 工具链
+        if: steps.meta.outputs.skip != 'true'
         shell: bash
         run: |
           rustup toolchain install stable --profile minimal
@@ -67,6 +78,7 @@ jobs:
           cargo --version
 
       - name: 缓存 Cargo 目录
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/cache@v4
         with:
           path: |
@@ -79,13 +91,16 @@ jobs:
             ${{ runner.os }}-cargo-release-
 
       - name: 运行测试
+        if: steps.meta.outputs.skip != 'true'
         run: cargo test --release --locked --target x86_64-pc-windows-msvc
 
       - name: 构建发布版可执行文件
+        if: steps.meta.outputs.skip != 'true'
         run: cargo build --release --locked --target x86_64-pc-windows-msvc
 
       - name: 打包
         id: package
+        if: steps.meta.outputs.skip != 'true'
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -100,11 +115,11 @@ jobs:
           Compress-Archive -Path $stage -DestinationPath $zip -Force
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           "$hash  $name.zip" | Out-File -FilePath "$zip.sha256" -Encoding ascii
-          "zip=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           Get-ChildItem dist
 
       - name: 上传构建产物
+        if: steps.meta.outputs.skip != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.meta.outputs.name }}
@@ -114,6 +129,7 @@ jobs:
           if-no-files-found: error
 
       - name: 生成发布说明
+        if: steps.meta.outputs.skip != 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -123,10 +139,10 @@ jobs:
           压缩包内含：
 
           - \`flype-word.exe\`：命令行工具，提供 \`extract\` 和 \`encode\` 两个子命令。
-          - \`flype-word-gui.exe\`：图形界面，字体已内嵌，解压即用。
+          - \`flype-word-gui.exe\`：图形界面，界面字体已嵌入，解压即用。
           - \`README.md\`、\`sample.txt\`：使用说明与示例原文。
 
-          解压后直接运行即可，无需安装运行库。
+          解压后直接运行，无需额外安装运行库或字体。
 
           SHA256（\`${{ steps.meta.outputs.name }}.zip\`）：
 
@@ -137,6 +153,7 @@ jobs:
           cat release-notes.md
 
       - name: 创建 GitHub Release
+        if: steps.meta.outputs.skip != 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -144,13 +161,13 @@ jobs:
           set -euo pipefail
           tag='${{ steps.meta.outputs.tag }}'
           name='${{ steps.meta.outputs.name }}'
-          args=(--title "flype-word $tag" --notes-file release-notes.md --target "$GITHUB_SHA")
-          if [ "${{ inputs.prerelease }}" = "true" ]; then
-            args+=(--prerelease)
-          fi
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" "dist/$name.zip" "dist/$name.zip.sha256" --clobber
           else
+            args=(--title "flype-word $tag" --notes-file release-notes.md --target "$GITHUB_SHA")
+            if [ "${{ inputs.prerelease }}" = "true" ]; then
+              args+=(--prerelease)
+            fi
             gh release create "$tag" "${args[@]}" "dist/$name.zip" "dist/$name.zip.sha256"
           fi
           gh release view "$tag"
